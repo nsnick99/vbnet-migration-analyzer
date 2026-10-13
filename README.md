@@ -1,106 +1,364 @@
-"use strict";
-/*
- * ATTENTION: An "eval-source-map" devtool has been used.
- * This devtool is neither made for production nor for readable output files.
- * It uses "eval()" calls to create a separate source file with attached SourceMaps in the browser devtools.
- * If you are trying to read the output file, select a different devtool (https://webpack.js.org/configuration/devtool/)
- * or disable the default devtool with "devtool: false".
- * If you are looking for production-ready output files, see mode: "production" (https://webpack.js.org/configuration/mode/).
- */
-(() => {
-var exports = {};
-exports.id = "app/api/vbnet/analyze/route";
-exports.ids = ["app/api/vbnet/analyze/route"];
-exports.modules = {
+from __future__ import annotations
+from pathlib import Path
+from collections import Counter
+import re
+import hashlib
+import xml.etree.ElementTree as ET
+from .models import AnalysisResult, Finding
+from .project import (find_projects, choose_project, parse_project, project_items, read_properties,
+                      all_files, expand_item_patterns, resolve_item_path, find_path, read_source_text)
+from .rules import analyze_vb_file
+from .build import verify_build
+from .guidance import apply_guidance
 
-/***/ "next/dist/compiled/next-server/app-page.runtime.dev.js":
-/*!*************************************************************************!*\
-  !*** external "next/dist/compiled/next-server/app-page.runtime.dev.js" ***!
-  \*************************************************************************/
-/***/ ((module) => {
+SOURCE_EXTENSIONS = {".vb", ".bas", ".cls", ".frm"}
+_GENERIC_TYPES = {"VB.NET", "VB.NET Windows Application"}
 
-module.exports = require("next/dist/compiled/next-server/app-page.runtime.dev.js");
 
-/***/ }),
+def norm(path: str) -> str:
+    """Display paths with forward slashes so the same file is never listed twice."""
+    return path.replace("\\", "/")
 
-/***/ "next/dist/compiled/next-server/app-route.runtime.dev.js":
-/*!**************************************************************************!*\
-  !*** external "next/dist/compiled/next-server/app-route.runtime.dev.js" ***!
-  \**************************************************************************/
-/***/ ((module) => {
 
-module.exports = require("next/dist/compiled/next-server/app-route.runtime.dev.js");
+def rel(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
 
-/***/ }),
 
-/***/ "child_process":
-/*!********************************!*\
-  !*** external "child_process" ***!
-  \********************************/
-/***/ ((module) => {
+def _add_unique(items: list[str], value: str):
+    value = norm(value)
+    if value not in items:
+        items.append(value)
 
-module.exports = require("child_process");
 
-/***/ }),
+def _is_wildcard(item: str) -> bool:
+    return "*" in item or "?" in item
 
-/***/ "fs":
-/*!*********************!*\
-  !*** external "fs" ***!
-  \*********************/
-/***/ ((module) => {
 
-module.exports = require("fs");
+def analyze(root: str | Path, run_build: bool = True) -> AnalysisResult:
+    root_path = Path(root).resolve()
+    scan_dir = root_path if root_path.is_dir() else root_path.parent
+    all_projects = find_projects(root_path)
+    if not all_projects:
+        raise FileNotFoundError(f"No .vbproj found under {root_path}")
+    project_path = choose_project(all_projects, root_path)
+    root_dir = project_path.parent
+    info, xml_root, parse_findings = parse_project(project_path)
+    parse_failed = any(f.id == "INT-001" for f in parse_findings)
+    items = project_items(xml_root)
+    files = all_files(root_dir)
+    file_types = Counter((p.suffix.lower() or "[no extension]") for p in files)
 
-/***/ }),
+    blockers: list[Finding] = []
+    risks: list[Finding] = []
+    integrity: list[Finding] = [f for f in parse_findings if not f.is_migration_blocker]
+    attention: list[str] = []          # files only (project-relative paths)
+    unresolved: list[dict] = []        # paths we could not evaluate (unknown MSBuild variables)
 
-/***/ "path":
-/*!***********************!*\
-  !*** external "path" ***!
-  \***********************/
-/***/ ((module) => {
+    def record(f: Finding):
+        (blockers if f.is_migration_blocker else risks).append(f)
+        if f.path:
+            _add_unique(attention, f.path)
 
-module.exports = require("path");
+    def resolve(item: str, kind: str) -> str | None:
+        resolved = resolve_item_path(item, root_dir)
+        if resolved is None:
+            unresolved.append({"kind": kind, "value": item})
+        return resolved
 
-/***/ }),
+    for f in parse_findings:            # e.g. unparsable project file -> must be a blocker
+        if f.is_migration_blocker:
+            blockers.append(f)
+            if f.path:
+                _add_unique(attention, f.path)
 
-/***/ "util":
-/*!***********************!*\
-  !*** external "util" ***!
-  \***********************/
-/***/ ((module) => {
+    if len(all_projects) > 1:
+        others = [rel(p, scan_dir) for p in all_projects if p != project_path]
+        integrity.append(Finding("INT-007", "integrity", "MEDIUM", "Multiple projects found",
+                                 f"{len(all_projects)} .vbproj files were found but only '{project_path.name}' was analyzed. "
+                                 f"Run the analyzer separately for: {', '.join(others)}.", rel(project_path, scan_dir)))
 
-module.exports = require("util");
+    # Explicit and globbed project files.
+    compile_files = expand_item_patterns(root_dir, items["Compile"])
+    compile_keys = {str(p).lower() for p in compile_files}
 
-/***/ }),
+    # Missing project items.
+    for kind in ("Compile", "EmbeddedResource", "Content", "None"):
+        for item in items[kind]:
+            if _is_wildcard(item):
+                continue
+            resolved = resolve(item, kind)
+            if resolved and find_path(resolved) is None:
+                blockers.append(Finding("INT-002", "integrity", "CRITICAL", "Missing project file",
+                                        f"{kind} item is declared but the file does not exist.", item, is_migration_blocker=True))
+                _add_unique(attention, item)
 
-/***/ "(rsc)/./node_modules/next/dist/build/webpack/loaders/next-app-loader.js?name=app%2Fapi%2Fvbnet%2Fanalyze%2Froute&page=%2Fapi%2Fvbnet%2Fanalyze%2Froute&appPaths=&pagePath=private-next-app-dir%2Fapi%2Fvbnet%2Fanalyze%2Froute.ts&appDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest%2Fapp&pageExtensions=tsx&pageExtensions=ts&pageExtensions=jsx&pageExtensions=js&rootDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest&isDev=true&tsconfigPath=tsconfig.json&basePath=&assetPrefix=&nextConfigOutput=&preferredRegion=&middlewareConfig=e30%3D!":
-/*!*******************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************!*\
-  !*** ./node_modules/next/dist/build/webpack/loaders/next-app-loader.js?name=app%2Fapi%2Fvbnet%2Fanalyze%2Froute&page=%2Fapi%2Fvbnet%2Fanalyze%2Froute&appPaths=&pagePath=private-next-app-dir%2Fapi%2Fvbnet%2Fanalyze%2Froute.ts&appDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest%2Fapp&pageExtensions=tsx&pageExtensions=ts&pageExtensions=jsx&pageExtensions=js&rootDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest&isDev=true&tsconfigPath=tsconfig.json&basePath=&assetPrefix=&nextConfigOutput=&preferredRegion=&middlewareConfig=e30%3D! ***!
-  \*******************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************************/
-/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+    # Duplicate item declarations: the same physical file declared more than
+    # once within the same item type. MSBuild's behavior here is inconsistent
+    # (sometimes a double-compile error, sometimes silently tolerated), so
+    # it's worth surfacing either way rather than guessing which applies.
+    for kind in ("Compile", "EmbeddedResource", "Content", "None"):
+        seen_items: dict[Path, list[str]] = {}
+        for item in items[kind]:
+            if _is_wildcard(item):
+                continue
+            resolved = resolve_item_path(item, root_dir)
+            if resolved is None:
+                continue
+            real = find_path(resolved)
+            if real is None:
+                continue  # already reported above if genuinely missing
+            seen_items.setdefault(real.resolve(), []).append(item)
+        for real_path, raw_values in seen_items.items():
+            if len(raw_values) > 1:
+                integrity.append(Finding("INT-010", "integrity", "MEDIUM", "Duplicate item declaration",
+                                         f"The same file is declared more than once as {kind} "
+                                         f"({', '.join(sorted(set(raw_values)))}).",
+                                         rel(real_path, root_dir), is_migration_blocker=False))
+                _add_unique(attention, rel(real_path, root_dir))
 
-eval("__webpack_require__.r(__webpack_exports__);\n/* harmony export */ __webpack_require__.d(__webpack_exports__, {\n/* harmony export */   originalPathname: () => (/* binding */ originalPathname),\n/* harmony export */   patchFetch: () => (/* binding */ patchFetch),\n/* harmony export */   requestAsyncStorage: () => (/* binding */ requestAsyncStorage),\n/* harmony export */   routeModule: () => (/* binding */ routeModule),\n/* harmony export */   serverHooks: () => (/* binding */ serverHooks),\n/* harmony export */   staticGenerationAsyncStorage: () => (/* binding */ staticGenerationAsyncStorage)\n/* harmony export */ });\n/* harmony import */ var next_dist_server_future_route_modules_app_route_module_compiled__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! next/dist/server/future/route-modules/app-route/module.compiled */ \"(rsc)/./node_modules/next/dist/server/future/route-modules/app-route/module.compiled.js\");\n/* harmony import */ var next_dist_server_future_route_modules_app_route_module_compiled__WEBPACK_IMPORTED_MODULE_0___default = /*#__PURE__*/__webpack_require__.n(next_dist_server_future_route_modules_app_route_module_compiled__WEBPACK_IMPORTED_MODULE_0__);\n/* harmony import */ var next_dist_server_future_route_kind__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! next/dist/server/future/route-kind */ \"(rsc)/./node_modules/next/dist/server/future/route-kind.js\");\n/* harmony import */ var next_dist_server_lib_patch_fetch__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! next/dist/server/lib/patch-fetch */ \"(rsc)/./node_modules/next/dist/server/lib/patch-fetch.js\");\n/* harmony import */ var next_dist_server_lib_patch_fetch__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(next_dist_server_lib_patch_fetch__WEBPACK_IMPORTED_MODULE_2__);\n/* harmony import */ var _mnt_MyDocuments_new_analyzer_migration_service_migration_analysis_api_latest_app_api_vbnet_analyze_route_ts__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./app/api/vbnet/analyze/route.ts */ \"(rsc)/./app/api/vbnet/analyze/route.ts\");\n\n\n\n\n// We inject the nextConfigOutput here so that we can use them in the route\n// module.\nconst nextConfigOutput = \"\"\nconst routeModule = new next_dist_server_future_route_modules_app_route_module_compiled__WEBPACK_IMPORTED_MODULE_0__.AppRouteRouteModule({\n    definition: {\n        kind: next_dist_server_future_route_kind__WEBPACK_IMPORTED_MODULE_1__.RouteKind.APP_ROUTE,\n        page: \"/api/vbnet/analyze/route\",\n        pathname: \"/api/vbnet/analyze\",\n        filename: \"route\",\n        bundlePath: \"app/api/vbnet/analyze/route\"\n    },\n    resolvedPagePath: \"/mnt/MyDocuments/new_analyzer/migration-service/migration_analysis_api_latest/app/api/vbnet/analyze/route.ts\",\n    nextConfigOutput,\n    userland: _mnt_MyDocuments_new_analyzer_migration_service_migration_analysis_api_latest_app_api_vbnet_analyze_route_ts__WEBPACK_IMPORTED_MODULE_3__\n});\n// Pull out the exports that we need to expose from the module. This should\n// be eliminated when we've moved the other routes to the new format. These\n// are used to hook into the route.\nconst { requestAsyncStorage, staticGenerationAsyncStorage, serverHooks } = routeModule;\nconst originalPathname = \"/api/vbnet/analyze/route\";\nfunction patchFetch() {\n    return (0,next_dist_server_lib_patch_fetch__WEBPACK_IMPORTED_MODULE_2__.patchFetch)({\n        serverHooks,\n        staticGenerationAsyncStorage\n    });\n}\n\n\n//# sourceMappingURL=app-route.js.map//# sourceURL=[module]\n//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiKHJzYykvLi9ub2RlX21vZHVsZXMvbmV4dC9kaXN0L2J1aWxkL3dlYnBhY2svbG9hZGVycy9uZXh0LWFwcC1sb2FkZXIuanM/bmFtZT1hcHAlMkZhcGklMkZ2Ym5ldCUyRmFuYWx5emUlMkZyb3V0ZSZwYWdlPSUyRmFwaSUyRnZibmV0JTJGYW5hbHl6ZSUyRnJvdXRlJmFwcFBhdGhzPSZwYWdlUGF0aD1wcml2YXRlLW5leHQtYXBwLWRpciUyRmFwaSUyRnZibmV0JTJGYW5hbHl6ZSUyRnJvdXRlLnRzJmFwcERpcj0lMkZtbnQlMkZNeURvY3VtZW50cyUyRm5ld19hbmFseXplciUyRm1pZ3JhdGlvbi1zZXJ2aWNlJTJGbWlncmF0aW9uX2FuYWx5c2lzX2FwaV9sYXRlc3QlMkZhcHAmcGFnZUV4dGVuc2lvbnM9dHN4JnBhZ2VFeHRlbnNpb25zPXRzJnBhZ2VFeHRlbnNpb25zPWpzeCZwYWdlRXh0ZW5zaW9ucz1qcyZyb290RGlyPSUyRm1udCUyRk15RG9jdW1lbnRzJTJGbmV3X2FuYWx5emVyJTJGbWlncmF0aW9uLXNlcnZpY2UlMkZtaWdyYXRpb25fYW5hbHlzaXNfYXBpX2xhdGVzdCZpc0Rldj10cnVlJnRzY29uZmlnUGF0aD10c2NvbmZpZy5qc29uJmJhc2VQYXRoPSZhc3NldFByZWZpeD0mbmV4dENvbmZpZ091dHB1dD0mcHJlZmVycmVkUmVnaW9uPSZtaWRkbGV3YXJlQ29uZmlnPWUzMCUzRCEiLCJtYXBwaW5ncyI6Ijs7Ozs7Ozs7Ozs7Ozs7O0FBQXNHO0FBQ3ZDO0FBQ2M7QUFDNEQ7QUFDekk7QUFDQTtBQUNBO0FBQ0Esd0JBQXdCLGdIQUFtQjtBQUMzQztBQUNBLGNBQWMseUVBQVM7QUFDdkI7QUFDQTtBQUNBO0FBQ0E7QUFDQSxLQUFLO0FBQ0w7QUFDQTtBQUNBLFlBQVk7QUFDWixDQUFDO0FBQ0Q7QUFDQTtBQUNBO0FBQ0EsUUFBUSxpRUFBaUU7QUFDekU7QUFDQTtBQUNBLFdBQVcsNEVBQVc7QUFDdEI7QUFDQTtBQUNBLEtBQUs7QUFDTDtBQUN1SDs7QUFFdkgiLCJzb3VyY2VzIjpbIndlYnBhY2s6Ly92Ym5ldC1taWdyYXRpb24tdG9vbC8/N2RhNSJdLCJzb3VyY2VzQ29udGVudCI6WyJpbXBvcnQgeyBBcHBSb3V0ZVJvdXRlTW9kdWxlIH0gZnJvbSBcIm5leHQvZGlzdC9zZXJ2ZXIvZnV0dXJlL3JvdXRlLW1vZHVsZXMvYXBwLXJvdXRlL21vZHVsZS5jb21waWxlZFwiO1xuaW1wb3J0IHsgUm91dGVLaW5kIH0gZnJvbSBcIm5leHQvZGlzdC9zZXJ2ZXIvZnV0dXJlL3JvdXRlLWtpbmRcIjtcbmltcG9ydCB7IHBhdGNoRmV0Y2ggYXMgX3BhdGNoRmV0Y2ggfSBmcm9tIFwibmV4dC9kaXN0L3NlcnZlci9saWIvcGF0Y2gtZmV0Y2hcIjtcbmltcG9ydCAqIGFzIHVzZXJsYW5kIGZyb20gXCIvbW50L015RG9jdW1lbnRzL25ld19hbmFseXplci9taWdyYXRpb24tc2VydmljZS9taWdyYXRpb25fYW5hbHlzaXNfYXBpX2xhdGVzdC9hcHAvYXBpL3ZibmV0L2FuYWx5emUvcm91dGUudHNcIjtcbi8vIFdlIGluamVjdCB0aGUgbmV4dENvbmZpZ091dHB1dCBoZXJlIHNvIHRoYXQgd2UgY2FuIHVzZSB0aGVtIGluIHRoZSByb3V0ZVxuLy8gbW9kdWxlLlxuY29uc3QgbmV4dENvbmZpZ091dHB1dCA9IFwiXCJcbmNvbnN0IHJvdXRlTW9kdWxlID0gbmV3IEFwcFJvdXRlUm91dGVNb2R1bGUoe1xuICAgIGRlZmluaXRpb246IHtcbiAgICAgICAga2luZDogUm91dGVLaW5kLkFQUF9ST1VURSxcbiAgICAgICAgcGFnZTogXCIvYXBpL3ZibmV0L2FuYWx5emUvcm91dGVcIixcbiAgICAgICAgcGF0aG5hbWU6IFwiL2FwaS92Ym5ldC9hbmFseXplXCIsXG4gICAgICAgIGZpbGVuYW1lOiBcInJvdXRlXCIsXG4gICAgICAgIGJ1bmRsZVBhdGg6IFwiYXBwL2FwaS92Ym5ldC9hbmFseXplL3JvdXRlXCJcbiAgICB9LFxuICAgIHJlc29sdmVkUGFnZVBhdGg6IFwiL21udC9NeURvY3VtZW50cy9uZXdfYW5hbHl6ZXIvbWlncmF0aW9uLXNlcnZpY2UvbWlncmF0aW9uX2FuYWx5c2lzX2FwaV9sYXRlc3QvYXBwL2FwaS92Ym5ldC9hbmFseXplL3JvdXRlLnRzXCIsXG4gICAgbmV4dENvbmZpZ091dHB1dCxcbiAgICB1c2VybGFuZFxufSk7XG4vLyBQdWxsIG91dCB0aGUgZXhwb3J0cyB0aGF0IHdlIG5lZWQgdG8gZXhwb3NlIGZyb20gdGhlIG1vZHVsZS4gVGhpcyBzaG91bGRcbi8vIGJlIGVsaW1pbmF0ZWQgd2hlbiB3ZSd2ZSBtb3ZlZCB0aGUgb3RoZXIgcm91dGVzIHRvIHRoZSBuZXcgZm9ybWF0LiBUaGVzZVxuLy8gYXJlIHVzZWQgdG8gaG9vayBpbnRvIHRoZSByb3V0ZS5cbmNvbnN0IHsgcmVxdWVzdEFzeW5jU3RvcmFnZSwgc3RhdGljR2VuZXJhdGlvbkFzeW5jU3RvcmFnZSwgc2VydmVySG9va3MgfSA9IHJvdXRlTW9kdWxlO1xuY29uc3Qgb3JpZ2luYWxQYXRobmFtZSA9IFwiL2FwaS92Ym5ldC9hbmFseXplL3JvdXRlXCI7XG5mdW5jdGlvbiBwYXRjaEZldGNoKCkge1xuICAgIHJldHVybiBfcGF0Y2hGZXRjaCh7XG4gICAgICAgIHNlcnZlckhvb2tzLFxuICAgICAgICBzdGF0aWNHZW5lcmF0aW9uQXN5bmNTdG9yYWdlXG4gICAgfSk7XG59XG5leHBvcnQgeyByb3V0ZU1vZHVsZSwgcmVxdWVzdEFzeW5jU3RvcmFnZSwgc3RhdGljR2VuZXJhdGlvbkFzeW5jU3RvcmFnZSwgc2VydmVySG9va3MsIG9yaWdpbmFsUGF0aG5hbWUsIHBhdGNoRmV0Y2gsICB9O1xuXG4vLyMgc291cmNlTWFwcGluZ1VSTD1hcHAtcm91dGUuanMubWFwIl0sIm5hbWVzIjpbXSwic291cmNlUm9vdCI6IiJ9\n//# sourceURL=webpack-internal:///(rsc)/./node_modules/next/dist/build/webpack/loaders/next-app-loader.js?name=app%2Fapi%2Fvbnet%2Fanalyze%2Froute&page=%2Fapi%2Fvbnet%2Fanalyze%2Froute&appPaths=&pagePath=private-next-app-dir%2Fapi%2Fvbnet%2Fanalyze%2Froute.ts&appDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest%2Fapp&pageExtensions=tsx&pageExtensions=ts&pageExtensions=jsx&pageExtensions=js&rootDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest&isDev=true&tsconfigPath=tsconfig.json&basePath=&assetPrefix=&nextConfigOutput=&preferredRegion=&middlewareConfig=e30%3D!\n");
+    # Project references.
+    for item in items["ProjectReference"]:
+        resolved = resolve(item, "ProjectReference")
+        if resolved and find_path(resolved) is None:
+            blockers.append(Finding("INT-003", "integrity", "CRITICAL", "Broken project reference",
+                                    "ProjectReference points to a missing project.", item, is_migration_blocker=True))
+            _add_unique(attention, item)
 
-/***/ }),
+    # Assembly references: existence of HintPath DLLs, plus a reference inventory.
+    assembly_refs: list[dict] = []
+    for e in xml_root.iter():
+        if e.tag.rsplit("}", 1)[-1] != "Reference":
+            continue
+        include = e.attrib.get("Include", "")
+        hint = None
+        for child in e:
+            if child.tag.rsplit("}", 1)[-1] == "HintPath" and child.text:
+                hint = child.text.strip()
+        exists: bool | None = None
+        if hint:
+            resolved = resolve(hint, "HintPath")
+            if resolved:
+                exists = find_path(resolved) is not None
+                if not exists:
+                    blockers.append(Finding("INT-004", "integrity", "CRITICAL", "Missing assembly",
+                                            f"Reference '{include}' has a missing HintPath assembly.", hint, is_migration_blocker=True))
+                    _add_unique(attention, hint)
+        assembly_refs.append({"name": include.split(",", 1)[0].strip(), "include": include, "hintPath": hint, "hintPathExists": exists})
 
-/***/ "(rsc)/./app/api/vbnet/analyze/route.ts":
-/*!****************************************!*\
-  !*** ./app/api/vbnet/analyze/route.ts ***!
-  \****************************************/
-/***/ ((__unused_webpack_module, __webpack_exports__, __webpack_require__) => {
+    # Imported .props/.targets. Imports guarded by Condition="Exists(...)" are optional by design.
+    for item in items["Import"]:
+        if _is_wildcard(item):
+            continue
+        resolved = resolve(item, "Import")
+        if resolved and find_path(resolved) is None:
+            blockers.append(Finding("INT-005", "integrity", "HIGH", "Missing imported build file",
+                                    "An imported .props/.targets file could not be found.", item, is_migration_blocker=True))
+            _add_unique(attention, item)
 
-eval("__webpack_require__.r(__webpack_exports__);\n/* harmony export */ __webpack_require__.d(__webpack_exports__, {\n/* harmony export */   POST: () => (/* binding */ POST)\n/* harmony export */ });\n/* harmony import */ var next_server__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! next/server */ \"(rsc)/./node_modules/next/dist/api/server.js\");\n/* harmony import */ var child_process__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! child_process */ \"child_process\");\n/* harmony import */ var child_process__WEBPACK_IMPORTED_MODULE_1___default = /*#__PURE__*/__webpack_require__.n(child_process__WEBPACK_IMPORTED_MODULE_1__);\n/* harmony import */ var util__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! util */ \"util\");\n/* harmony import */ var util__WEBPACK_IMPORTED_MODULE_2___default = /*#__PURE__*/__webpack_require__.n(util__WEBPACK_IMPORTED_MODULE_2__);\n/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! path */ \"path\");\n/* harmony import */ var path__WEBPACK_IMPORTED_MODULE_3___default = /*#__PURE__*/__webpack_require__.n(path__WEBPACK_IMPORTED_MODULE_3__);\n/* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! fs */ \"fs\");\n/* harmony import */ var fs__WEBPACK_IMPORTED_MODULE_4___default = /*#__PURE__*/__webpack_require__.n(fs__WEBPACK_IMPORTED_MODULE_4__);\n// /mnt/MyDocuments/new_analyzer/migration-service/migration_analysis_api_latest/app/api/vbnet/analyze/route.ts\n\n\n\n\n\nconst execAsync = (0,util__WEBPACK_IMPORTED_MODULE_2__.promisify)(child_process__WEBPACK_IMPORTED_MODULE_1__.exec);\n// ✅ Analyzer directory (where vbnet_migration_analyzer package lives)\nconst ANALYZER_DIR = (0,path__WEBPACK_IMPORTED_MODULE_3__.join)(process.cwd(), \"..\", \"..\", \"tools\", \"vbnet-project-health-analyzer-precision-classification_6738\");\nconst PYTHON_CMD = \"python3.11\";\nasync function POST(request) {\n    try {\n        const body = await request.json();\n        const { sourcePath } = body;\n        // Validate sourcePath\n        if (!sourcePath) {\n            return next_server__WEBPACK_IMPORTED_MODULE_0__.NextResponse.json({\n                error: \"sourcePath (local folder path) is required\"\n            }, {\n                status: 400\n            });\n        }\n        const resolvedPath = (0,path__WEBPACK_IMPORTED_MODULE_3__.resolve)(sourcePath);\n        if (!(0,fs__WEBPACK_IMPORTED_MODULE_4__.existsSync)(resolvedPath)) {\n            return next_server__WEBPACK_IMPORTED_MODULE_0__.NextResponse.json({\n                error: `Folder not found: ${resolvedPath}`\n            }, {\n                status: 400\n            });\n        }\n        // Run analyzer from its directory (critical for module resolution)\n        const result = await execAsync(`${PYTHON_CMD} -m vbnet_migration_analyzer \"${resolvedPath}\"`, {\n            cwd: ANALYZER_DIR,\n            timeout: 600000\n        });\n        // Read output files\n        const srcJson = (0,path__WEBPACK_IMPORTED_MODULE_3__.join)(ANALYZER_DIR, \"project-health.json\");\n        const srcTxt = (0,path__WEBPACK_IMPORTED_MODULE_3__.join)(ANALYZER_DIR, \"migration-report.txt\");\n        if (!(0,fs__WEBPACK_IMPORTED_MODULE_4__.existsSync)(srcJson)) {\n            throw new Error(`Analyzer did not produce: ${srcJson}`);\n        }\n        if (!(0,fs__WEBPACK_IMPORTED_MODULE_4__.existsSync)(srcTxt)) {\n            throw new Error(`Analyzer did not produce: ${srcTxt}`);\n        }\n        const reportJson = JSON.parse((0,fs__WEBPACK_IMPORTED_MODULE_4__.readFileSync)(srcJson, \"utf8\"));\n        const reportTxt = (0,fs__WEBPACK_IMPORTED_MODULE_4__.readFileSync)(srcTxt, \"utf8\");\n        return next_server__WEBPACK_IMPORTED_MODULE_0__.NextResponse.json({\n            status: \"completed\",\n            summary: `Analyzed ${reportJson.totalFiles || 0} files. Warnings: ${reportJson.warnings || 0}, Errors: ${reportJson.errors || 0}`,\n            metrics: {\n                totalFiles: reportJson.totalFiles || 0,\n                warnings: reportJson.warnings || 0,\n                errors: reportJson.errors || 0,\n                precisionScore: reportJson.precisionScore || 0.95\n            },\n            report: reportTxt\n        });\n    } catch (error) {\n        console.error(\"VB.NET analysis failed:\", error);\n        return next_server__WEBPACK_IMPORTED_MODULE_0__.NextResponse.json({\n            error: \"Analysis failed\",\n            details: error instanceof Error ? error.message : \"Unknown error\",\n            stderr: error.stderr || \"\"\n        }, {\n            status: 500\n        });\n    }\n}\n//# sourceURL=[module]\n//# sourceMappingURL=data:application/json;charset=utf-8;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiKHJzYykvLi9hcHAvYXBpL3ZibmV0L2FuYWx5emUvcm91dGUudHMiLCJtYXBwaW5ncyI6Ijs7Ozs7Ozs7Ozs7OztBQUFBLCtHQUErRztBQUN2RDtBQUNuQjtBQUNKO0FBQ0k7QUFDUztBQUU5QyxNQUFNTyxZQUFZTCwrQ0FBU0EsQ0FBQ0QsK0NBQUlBO0FBRWhDLHNFQUFzRTtBQUN0RSxNQUFNTyxlQUFlTCwwQ0FBSUEsQ0FDdkJNLFFBQVFDLEdBQUcsSUFDWCxNQUFNLE1BQU0sU0FBUztBQUd2QixNQUFNQyxhQUFhO0FBRVosZUFBZUMsS0FBS0MsT0FBb0I7SUFDN0MsSUFBSTtRQUNGLE1BQU1DLE9BQU8sTUFBTUQsUUFBUUUsSUFBSTtRQUMvQixNQUFNLEVBQUVDLFVBQVUsRUFBRSxHQUFHRjtRQUV2QixzQkFBc0I7UUFDdEIsSUFBSSxDQUFDRSxZQUFZO1lBQ2YsT0FBT2hCLHFEQUFZQSxDQUFDZSxJQUFJLENBQ3RCO2dCQUFFRSxPQUFPO1lBQTZDLEdBQ3REO2dCQUFFQyxRQUFRO1lBQUk7UUFFbEI7UUFFQSxNQUFNQyxlQUFlZiw2Q0FBT0EsQ0FBQ1k7UUFDN0IsSUFBSSxDQUFDWCw4Q0FBVUEsQ0FBQ2MsZUFBZTtZQUM3QixPQUFPbkIscURBQVlBLENBQUNlLElBQUksQ0FDdEI7Z0JBQUVFLE9BQU8sQ0FBQyxrQkFBa0IsRUFBRUUsYUFBYSxDQUFDO1lBQUMsR0FDN0M7Z0JBQUVELFFBQVE7WUFBSTtRQUVsQjtRQUVBLG1FQUFtRTtRQUNuRSxNQUFNRSxTQUFTLE1BQU1iLFVBQ25CLENBQUMsRUFBRUksV0FBVyw4QkFBOEIsRUFBRVEsYUFBYSxDQUFDLENBQUMsRUFDN0Q7WUFBRVQsS0FBS0Y7WUFBY2EsU0FBUztRQUFRO1FBR3hDLG9CQUFvQjtRQUNwQixNQUFNQyxVQUFVbkIsMENBQUlBLENBQUNLLGNBQWM7UUFDbkMsTUFBTWUsU0FBU3BCLDBDQUFJQSxDQUFDSyxjQUFjO1FBRWxDLElBQUksQ0FBQ0gsOENBQVVBLENBQUNpQixVQUFVO1lBQ3hCLE1BQU0sSUFBSUUsTUFBTSxDQUFDLDBCQUEwQixFQUFFRixRQUFRLENBQUM7UUFDeEQ7UUFDQSxJQUFJLENBQUNqQiw4Q0FBVUEsQ0FBQ2tCLFNBQVM7WUFDdkIsTUFBTSxJQUFJQyxNQUFNLENBQUMsMEJBQTBCLEVBQUVELE9BQU8sQ0FBQztRQUN2RDtRQUVBLE1BQU1FLGFBQWFDLEtBQUtDLEtBQUssQ0FBQ3JCLGdEQUFZQSxDQUFDZ0IsU0FBUztRQUNwRCxNQUFNTSxZQUFZdEIsZ0RBQVlBLENBQUNpQixRQUFRO1FBRXZDLE9BQU92QixxREFBWUEsQ0FBQ2UsSUFBSSxDQUFDO1lBQ3ZCRyxRQUFRO1lBQ1JXLFNBQVMsQ0FBQyxTQUFTLEVBQUVKLFdBQVdLLFVBQVUsSUFBSSxFQUFFLGtCQUFrQixFQUFFTCxXQUFXTSxRQUFRLElBQUksRUFBRSxVQUFVLEVBQUVOLFdBQVdPLE1BQU0sSUFBSSxFQUFFLENBQUM7WUFDaklDLFNBQVM7Z0JBQ1BILFlBQVlMLFdBQVdLLFVBQVUsSUFBSTtnQkFDckNDLFVBQVVOLFdBQVdNLFFBQVEsSUFBSTtnQkFDakNDLFFBQVFQLFdBQVdPLE1BQU0sSUFBSTtnQkFDN0JFLGdCQUFnQlQsV0FBV1MsY0FBYyxJQUFJO1lBQy9DO1lBQ0FDLFFBQVFQO1FBQ1Y7SUFFRixFQUFFLE9BQU9YLE9BQVk7UUFDbkJtQixRQUFRbkIsS0FBSyxDQUFDLDJCQUEyQkE7UUFDekMsT0FBT2pCLHFEQUFZQSxDQUFDZSxJQUFJLENBQ3RCO1lBQ0VFLE9BQU87WUFDUG9CLFNBQVNwQixpQkFBaUJPLFFBQVFQLE1BQU1xQixPQUFPLEdBQUc7WUFDbERDLFFBQVF0QixNQUFNc0IsTUFBTSxJQUFJO1FBQzFCLEdBQ0E7WUFBRXJCLFFBQVE7UUFBSTtJQUVsQjtBQUNGIiwic291cmNlcyI6WyJ3ZWJwYWNrOi8vdmJuZXQtbWlncmF0aW9uLXRvb2wvLi9hcHAvYXBpL3ZibmV0L2FuYWx5emUvcm91dGUudHM/ZjU3OSJdLCJzb3VyY2VzQ29udGVudCI6WyIvLyAvbW50L015RG9jdW1lbnRzL25ld19hbmFseXplci9taWdyYXRpb24tc2VydmljZS9taWdyYXRpb25fYW5hbHlzaXNfYXBpX2xhdGVzdC9hcHAvYXBpL3ZibmV0L2FuYWx5emUvcm91dGUudHNcbmltcG9ydCB7IE5leHRSZXF1ZXN0LCBOZXh0UmVzcG9uc2UgfSBmcm9tICduZXh0L3NlcnZlcic7XG5pbXBvcnQgeyBleGVjIH0gZnJvbSAnY2hpbGRfcHJvY2Vzcyc7XG5pbXBvcnQgeyBwcm9taXNpZnkgfSBmcm9tICd1dGlsJztcbmltcG9ydCB7IGpvaW4sIHJlc29sdmUgfSBmcm9tICdwYXRoJztcbmltcG9ydCB7IGV4aXN0c1N5bmMsIHJlYWRGaWxlU3luYyB9IGZyb20gJ2ZzJztcblxuY29uc3QgZXhlY0FzeW5jID0gcHJvbWlzaWZ5KGV4ZWMpO1xuXG4vLyDinIUgQW5hbHl6ZXIgZGlyZWN0b3J5ICh3aGVyZSB2Ym5ldF9taWdyYXRpb25fYW5hbHl6ZXIgcGFja2FnZSBsaXZlcylcbmNvbnN0IEFOQUxZWkVSX0RJUiA9IGpvaW4oXG4gIHByb2Nlc3MuY3dkKCksXG4gICcuLicsICcuLicsICd0b29scycsICd2Ym5ldC1wcm9qZWN0LWhlYWx0aC1hbmFseXplci1wcmVjaXNpb24tY2xhc3NpZmljYXRpb25fNjczOCdcbik7XG5cbmNvbnN0IFBZVEhPTl9DTUQgPSAncHl0aG9uMy4xMSc7XG5cbmV4cG9ydCBhc3luYyBmdW5jdGlvbiBQT1NUKHJlcXVlc3Q6IE5leHRSZXF1ZXN0KSB7XG4gIHRyeSB7XG4gICAgY29uc3QgYm9keSA9IGF3YWl0IHJlcXVlc3QuanNvbigpO1xuICAgIGNvbnN0IHsgc291cmNlUGF0aCB9ID0gYm9keTtcblxuICAgIC8vIFZhbGlkYXRlIHNvdXJjZVBhdGhcbiAgICBpZiAoIXNvdXJjZVBhdGgpIHtcbiAgICAgIHJldHVybiBOZXh0UmVzcG9uc2UuanNvbihcbiAgICAgICAgeyBlcnJvcjogJ3NvdXJjZVBhdGggKGxvY2FsIGZvbGRlciBwYXRoKSBpcyByZXF1aXJlZCcgfSxcbiAgICAgICAgeyBzdGF0dXM6IDQwMCB9XG4gICAgICApO1xuICAgIH1cblxuICAgIGNvbnN0IHJlc29sdmVkUGF0aCA9IHJlc29sdmUoc291cmNlUGF0aCk7XG4gICAgaWYgKCFleGlzdHNTeW5jKHJlc29sdmVkUGF0aCkpIHtcbiAgICAgIHJldHVybiBOZXh0UmVzcG9uc2UuanNvbihcbiAgICAgICAgeyBlcnJvcjogYEZvbGRlciBub3QgZm91bmQ6ICR7cmVzb2x2ZWRQYXRofWAgfSxcbiAgICAgICAgeyBzdGF0dXM6IDQwMCB9XG4gICAgICApO1xuICAgIH1cblxuICAgIC8vIFJ1biBhbmFseXplciBmcm9tIGl0cyBkaXJlY3RvcnkgKGNyaXRpY2FsIGZvciBtb2R1bGUgcmVzb2x1dGlvbilcbiAgICBjb25zdCByZXN1bHQgPSBhd2FpdCBleGVjQXN5bmMoXG4gICAgICBgJHtQWVRIT05fQ01EfSAtbSB2Ym5ldF9taWdyYXRpb25fYW5hbHl6ZXIgXCIke3Jlc29sdmVkUGF0aH1cImAsXG4gICAgICB7IGN3ZDogQU5BTFlaRVJfRElSLCB0aW1lb3V0OiA2MDBfMDAwIH1cbiAgICApO1xuXG4gICAgLy8gUmVhZCBvdXRwdXQgZmlsZXNcbiAgICBjb25zdCBzcmNKc29uID0gam9pbihBTkFMWVpFUl9ESVIsICdwcm9qZWN0LWhlYWx0aC5qc29uJyk7XG4gICAgY29uc3Qgc3JjVHh0ID0gam9pbihBTkFMWVpFUl9ESVIsICdtaWdyYXRpb24tcmVwb3J0LnR4dCcpO1xuXG4gICAgaWYgKCFleGlzdHNTeW5jKHNyY0pzb24pKSB7XG4gICAgICB0aHJvdyBuZXcgRXJyb3IoYEFuYWx5emVyIGRpZCBub3QgcHJvZHVjZTogJHtzcmNKc29ufWApO1xuICAgIH1cbiAgICBpZiAoIWV4aXN0c1N5bmMoc3JjVHh0KSkge1xuICAgICAgdGhyb3cgbmV3IEVycm9yKGBBbmFseXplciBkaWQgbm90IHByb2R1Y2U6ICR7c3JjVHh0fWApO1xuICAgIH1cblxuICAgIGNvbnN0IHJlcG9ydEpzb24gPSBKU09OLnBhcnNlKHJlYWRGaWxlU3luYyhzcmNKc29uLCAndXRmOCcpKTtcbiAgICBjb25zdCByZXBvcnRUeHQgPSByZWFkRmlsZVN5bmMoc3JjVHh0LCAndXRmOCcpO1xuXG4gICAgcmV0dXJuIE5leHRSZXNwb25zZS5qc29uKHtcbiAgICAgIHN0YXR1czogJ2NvbXBsZXRlZCcsXG4gICAgICBzdW1tYXJ5OiBgQW5hbHl6ZWQgJHtyZXBvcnRKc29uLnRvdGFsRmlsZXMgfHwgMH0gZmlsZXMuIFdhcm5pbmdzOiAke3JlcG9ydEpzb24ud2FybmluZ3MgfHwgMH0sIEVycm9yczogJHtyZXBvcnRKc29uLmVycm9ycyB8fCAwfWAsXG4gICAgICBtZXRyaWNzOiB7XG4gICAgICAgIHRvdGFsRmlsZXM6IHJlcG9ydEpzb24udG90YWxGaWxlcyB8fCAwLFxuICAgICAgICB3YXJuaW5nczogcmVwb3J0SnNvbi53YXJuaW5ncyB8fCAwLFxuICAgICAgICBlcnJvcnM6IHJlcG9ydEpzb24uZXJyb3JzIHx8IDAsXG4gICAgICAgIHByZWNpc2lvblNjb3JlOiByZXBvcnRKc29uLnByZWNpc2lvblNjb3JlIHx8IDAuOTVcbiAgICAgIH0sXG4gICAgICByZXBvcnQ6IHJlcG9ydFR4dFxuICAgIH0pO1xuXG4gIH0gY2F0Y2ggKGVycm9yOiBhbnkpIHtcbiAgICBjb25zb2xlLmVycm9yKCdWQi5ORVQgYW5hbHlzaXMgZmFpbGVkOicsIGVycm9yKTtcbiAgICByZXR1cm4gTmV4dFJlc3BvbnNlLmpzb24oXG4gICAgICB7XG4gICAgICAgIGVycm9yOiAnQW5hbHlzaXMgZmFpbGVkJyxcbiAgICAgICAgZGV0YWlsczogZXJyb3IgaW5zdGFuY2VvZiBFcnJvciA/IGVycm9yLm1lc3NhZ2UgOiAnVW5rbm93biBlcnJvcicsXG4gICAgICAgIHN0ZGVycjogZXJyb3Iuc3RkZXJyIHx8ICcnXG4gICAgICB9LFxuICAgICAgeyBzdGF0dXM6IDUwMCB9XG4gICAgKTtcbiAgfVxufSJdLCJuYW1lcyI6WyJOZXh0UmVzcG9uc2UiLCJleGVjIiwicHJvbWlzaWZ5Iiwiam9pbiIsInJlc29sdmUiLCJleGlzdHNTeW5jIiwicmVhZEZpbGVTeW5jIiwiZXhlY0FzeW5jIiwiQU5BTFlaRVJfRElSIiwicHJvY2VzcyIsImN3ZCIsIlBZVEhPTl9DTUQiLCJQT1NUIiwicmVxdWVzdCIsImJvZHkiLCJqc29uIiwic291cmNlUGF0aCIsImVycm9yIiwic3RhdHVzIiwicmVzb2x2ZWRQYXRoIiwicmVzdWx0IiwidGltZW91dCIsInNyY0pzb24iLCJzcmNUeHQiLCJFcnJvciIsInJlcG9ydEpzb24iLCJKU09OIiwicGFyc2UiLCJyZXBvcnRUeHQiLCJzdW1tYXJ5IiwidG90YWxGaWxlcyIsIndhcm5pbmdzIiwiZXJyb3JzIiwibWV0cmljcyIsInByZWNpc2lvblNjb3JlIiwicmVwb3J0IiwiY29uc29sZSIsImRldGFpbHMiLCJtZXNzYWdlIiwic3RkZXJyIl0sInNvdXJjZVJvb3QiOiIifQ==\n//# sourceURL=webpack-internal:///(rsc)/./app/api/vbnet/analyze/route.ts\n");
+    # COM references: presence alone is a migration concern.
+    for kind in ("COMReference", "COMFileReference"):
+        for item in items[kind]:
+            blockers.append(Finding("MIG-001", "migration", "HIGH", "COM dependency",
+                                    f"{kind} detected in the project; target compatibility must be established.",
+                                    item, is_migration_blocker=True))
 
-/***/ })
+    # Third-party assemblies are migration risks. Missing HintPath assemblies are handled above as blockers.
+    for ref in assembly_refs:
+        name = ref["name"]
+        if name and not re.match(r"^(System|Microsoft|mscorlib|netstandard|PresentationFramework|PresentationCore|WindowsBase)\b", name, re.I):
+            risks.append(Finding("MIG-008", "migration", "HIGH", "Third-party assembly dependency",
+                                 f"Non-framework assembly reference '{name}' requires target-platform compatibility review.",
+                                 name, is_migration_blocker=False))
 
-};
-;
+    # Read each VB file exactly once, defensively. A file that cannot be
+    # confidently read is a blind spot in every finding below it, so it is
+    # reported rather than silently skipped.
+    vb_files = [p for p in files if p.suffix.lower() == ".vb"]
+    source_cache: dict[Path, str] = {}
+    for path in vb_files:
+        text, status, detail = read_source_text(path)
+        display = rel(path, root_dir)
+        if status == "unreadable":
+            integrity.append(Finding("INT-011", "integrity", "HIGH", "Unreadable file",
+                                     f"Could not read this file, so it was not scanned: {detail}.",
+                                     display, is_migration_blocker=False))
+            _add_unique(attention, display)
+            continue
+        if status == "encoding_fallback":
+            integrity.append(Finding("INT-012", "integrity", "LOW", "Non-UTF-8 source file",
+                                     f"File was not valid UTF-8 ({detail}); pattern matches from it should be spot-checked.",
+                                     display, is_migration_blocker=False))
+            _add_unique(attention, display)
+        elif status == "empty":
+            integrity.append(Finding("INT-013", "integrity", "LOW", "Empty file",
+                                     "File exists but contains no content.", display, is_migration_blocker=False))
+            _add_unique(attention, display)
+        source_cache[path] = text
 
-// load runtime
-var __webpack_require__ = require("../../../../webpack-runtime.js");
-__webpack_require__.C(exports);
-var __webpack_exec__ = (moduleId) => (__webpack_require__(__webpack_require__.s = moduleId))
-var __webpack_exports__ = __webpack_require__.X(0, ["vendor-chunks/next"], () => (__webpack_exec__("(rsc)/./node_modules/next/dist/build/webpack/loaders/next-app-loader.js?name=app%2Fapi%2Fvbnet%2Fanalyze%2Froute&page=%2Fapi%2Fvbnet%2Fanalyze%2Froute&appPaths=&pagePath=private-next-app-dir%2Fapi%2Fvbnet%2Fanalyze%2Froute.ts&appDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest%2Fapp&pageExtensions=tsx&pageExtensions=ts&pageExtensions=jsx&pageExtensions=js&rootDir=%2Fmnt%2FMyDocuments%2Fnew_analyzer%2Fmigration-service%2Fmigration_analysis_api_latest&isDev=true&tsconfigPath=tsconfig.json&basePath=&assetPrefix=&nextConfigOutput=&preferredRegion=&middlewareConfig=e30%3D!")));
-module.exports = __webpack_exports__;
+    if info.project_type in _GENERIC_TYPES:
+        source_sample = "\n".join(text[:20000] for text in source_cache.values())
+        if re.search(r"System\.Windows\.Forms|Inherits\s+Form\b|Class\s+Form\b", source_sample, re.I):
+            info.project_type = "VB.NET Windows Forms"
+        elif re.search(r"System\.Windows\.Controls|System\.Windows\.Markup", source_sample, re.I):
+            info.project_type = "VB.NET WPF"
+    if info.project_type in _GENERIC_TYPES | {"VB.NET Console Application", "VB.NET Class Library"} \
+            and any(p.name.lower() == "web.config" for p in files):
+        info.project_type = "VB.NET Web"
 
-})();
+    # Analyze VB source. SDK-style (implicit glob, no explicit Compile items)
+    # is only claimed when the project file actually parsed -- a project we
+    # could not parse at all gets neither label, and skips orphan-detection
+    # below rather than treating every .vb file on disk as an "orphan".
+    sdk_style = bool(info.sdk) or (not items["Compile"] and not parse_failed)
+    for path, text in source_cache.items():
+        findings = analyze_vb_file(path, text, rel(path, root_dir))
+        for f in findings:
+            record(f)
+
+    # Orphan source files: only meaningful for classic explicit-Compile projects
+    # whose project file actually parsed.
+    if not sdk_style and not parse_failed:
+        for path in files:
+            if path.suffix.lower() in SOURCE_EXTENSIONS and str(path.resolve()).lower() not in compile_keys:
+                integrity.append(Finding("INT-006", "integrity", "MEDIUM", "Orphan source file",
+                                         "Source file exists on disk but is not included by the project.",
+                                         rel(path, root_dir), is_migration_blocker=False))
+                _add_unique(attention, rel(path, root_dir))
+
+    # Configuration integrity (App.config, Web.config, packages.config, and any
+    # other *.config file). Malformed configuration should be fixed before a
+    # semantic IR is generated because configuration is part of application behavior.
+    for cfg in files:
+        if cfg.suffix.lower() == ".config":
+            try:
+                ET.parse(cfg)
+            except (ET.ParseError, OSError) as exc:
+                blockers.append(Finding("INT-008", "integrity", "HIGH", "Invalid configuration file",
+                                        f"Configuration XML could not be parsed: {exc}",
+                                        rel(cfg, root_dir), is_migration_blocker=True))
+                _add_unique(attention, rel(cfg, root_dir))
+
+    # Files differing only by case can silently merge or collide on Windows
+    # vs. case-sensitive build/CI environments.
+    seen_case: dict[str, Path] = {}
+    for path in files:
+        key = rel(path, root_dir).lower()
+        previous = seen_case.get(key)
+        if previous and previous.resolve() != path.resolve():
+            blockers.append(Finding("INT-009", "integrity", "HIGH", "Case-colliding files",
+                                     "Two physical files differ only by case; this can cause cross-platform and build inconsistencies.",
+                                     rel(path, root_dir), f"Also found: {rel(previous, root_dir)}", True))
+            _add_unique(attention, rel(path, root_dir))
+        else:
+            seen_case[key] = path
+
+    # One real build is stronger than regex-only source checks. On an
+    # air-gapped machine the locally installed toolchain is used (if any) and
+    # no network access is requested.
+    if run_build:
+        build_findings, build_verified, build_tool = verify_build(project_path)
+    else:
+        build_findings, build_verified, build_tool = [], False, None
+    for f in build_findings:
+        if f.is_migration_blocker:
+            blockers.append(f)
+        else:
+            risks.append(f)
+        if f.path and f.path != project_path.name:
+            _add_unique(attention, f.path)
+
+    # Enrich and classify every finding once all evidence has been collected.
+    # `is_migration_blocker` answers "is this inherently blocking?" while
+    # `blocks_ir` answers the stricter readiness question "can the next
+    # semantic stage safely consume this project?". A build/toolchain failure
+    # may block IR without being a defect in the application itself.
+    all_findings = _dedupe(blockers + risks + integrity)
+    blockers, risks, integrity = [], [], []
+    for finding in all_findings:
+        apply_guidance(finding)
+        if finding.blocks_ir:
+            blockers.append(finding)
+        elif finding.category == "integrity":
+            integrity.append(finding)
+        else:
+            risks.append(finding)
+
+    blockers = _dedupe(blockers)
+    risks = _dedupe(risks)
+    integrity = _dedupe(integrity)
+    attention = sorted(set(attention), key=str.lower)
+
+    project_key = hashlib.sha256(str(project_path.resolve()).encode("utf-8")).hexdigest()[:16]
+    return AnalysisResult(info, len(files), dict(sorted(file_types.items())),
+                          blockers, risks, integrity, attention, build_verified, build_tool, project_key)
+
+
+def _dedupe(findings: list[Finding]) -> list[Finding]:
+    seen = set(); out = []
+    for f in findings:
+        key = (f.id, f.title, f.path, f.message)
+        if key not in seen:
+            seen.add(key); out.append(f)
+    return out
+
+
+def _finding_key(f: Finding) -> tuple:
+    # Deliberately excludes `id` (not guaranteed to round-trip through a JSON
+    # file written by an older version of the analyzer) and `line` (an
+    # unrelated edit elsewhere in the file can shift a line number without
+    # the underlying issue actually changing, which would otherwise show up
+    # as a false RESOLVED+NEW pair instead of one PERSISTING finding).
+    return (f.category, f.title, f.path, f.evidence)
+
+
+def _old_key(item: dict) -> tuple:
+    return (item.get("category"), item.get("title"), item.get("path"), item.get("evidence"))
+
+
+def verify_resolution(result: AnalysisResult, previous: dict | None) -> AnalysisResult:
+    """Compare the current scan with the previous health JSON for the same project."""
+    if not previous:
+        result.new_findings = result.blockers + result.risks + result.integrity_issues
+        for f in result.new_findings:
+            f.status = "NEW"
+        return result
+
+    health = previous.get("health", {})
+    if health.get("projectKey") != result.project_key:
+        result.new_findings = result.blockers + result.risks + result.integrity_issues
+        for f in result.new_findings:
+            f.status = "NEW"
+        return result
+
+    old = []
+    # Newer health files keep every IR-blocking prerequisite together.
+    # Fall back to the legacy migrationBlockers field for backward compatibility.
+    groups = ("blockingPrerequisites", "risks", "integrityIssues") if "blockingPrerequisites" in health else ("migrationBlockers", "risks", "integrityIssues")
+    for group in groups:
+        old.extend(health.get(group, []))
+    old_by_key = {_old_key(item): item for item in old}
+
+    current = result.blockers + result.risks + result.integrity_issues
+    current_keys = {_finding_key(f) for f in current}
+    for f in current:
+        if _finding_key(f) in old_by_key:
+            f.status = "PERSISTING"
+            result.persisting_findings.append(f)
+        else:
+            f.status = "NEW"
+            result.new_findings.append(f)
+
+    for item in old:
+        if _old_key(item) not in current_keys:
+            f = Finding(
+                item.get("id", "UNKNOWN"), item.get("category", "unknown"), item.get("severity", "UNKNOWN"),
+                item.get("title", "Previous finding"), item.get("message", ""), item.get("path"),
+                item.get("evidence"), item.get("is_migration_blocker", False), item.get("line"), item.get("occurrences"),
+                item.get("explanation"), item.get("recommendation"), item.get("verification"), "RESOLVED"
+            )
+            apply_guidance(f)
+            result.resolved_findings.append(f)
+    return result
