@@ -1,0 +1,8 @@
+# Runtime: Python standard library only.
+#
+# Build verification uses a locally installed MSBuild, dotnet SDK, or xbuild.
+# No network access or package download is required by the analyzer itself.
+#
+# Optional future semantic phase:
+# a local Roslyn/.NET sidecar can be added when symbol-level analysis is needed
+# before migration IR generation.

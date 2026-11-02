@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vbnet-migration-analyzer"
+version = "0.5.0"
+description = "VB.NET project health and migration-readiness preflight analyzer"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.scripts]
+vbnet-analyzer = "vbnet_migration_analyzer.cli:main"
+
+# Explicit package list: without this, setuptools auto-discovery sees the empty
+# src/ scaffold and the sample project and installs nothing usable.
+[tool.setuptools.packages.find]
+include = ["vbnet_migration_analyzer*"]
+
+[tool.setuptools.package-data]
+vbnet_migration_analyzer = ["roslyn/*.cs", "roslyn/*.ps1", "roslyn/*.md"]

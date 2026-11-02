@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Analyzer runtime output
+migration-report.txt
+project-health.json
+
+# Locally compiled Roslyn sidecar
+vbnet_migration_analyzer/roslyn/bin/
