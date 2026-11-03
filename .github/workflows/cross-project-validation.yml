@@ -1,0 +1,218 @@
+name: Cross-project VB.NET validation
+
+on:
+  push:
+    branches:
+      - test/cross-project-validation-2026-11-03
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out analyzer
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install analyzer
+        run: python -m pip install -e .
+
+      - name: Fetch public VB.NET sample applications
+        shell: bash
+        run: |
+          mkdir -p samples
+          git clone --depth 1 --branch master https://github.com/RJCodeAdvance/Login-Plano-Moderno-Transparente-WinForm-VB.git samples/winforms-login
+          git clone --depth 1 --branch master https://github.com/jm-ramirez/Gestion.git samples/gestion
+          git clone --depth 1 --branch master https://github.com/kaedei/EmployeeManagementSystem.git samples/employee-management
+          git clone --depth 1 --branch master https://github.com/KlausLoeffelmann/VBAspNetCoreWebApi.git samples/vbcore-webapi
+          git clone --depth 1 --branch master https://github.com/MattHoneycutt/BlackMagicMVC.git samples/blackmagic-mvc
+          git clone --depth 1 --branch main https://github.com/CommunityVB/Community.VisualBasic.git samples/community-vb
+
+      - name: Run analyzer across application types
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          import sys
+          from collections import Counter
+          from pathlib import Path
+
+          root = Path.cwd()
+          results = root / "validation-results"
+          results.mkdir(exist_ok=True)
+
+          cases = [
+              ("winforms_login", "WinForms login application", "samples/winforms-login/FlatLoginForm/FlatLoginForm.vbproj"),
+              ("winforms_business_app", "Multi-project business application - WinForms UI", "samples/gestion/Principal/Principal.vbproj"),
+              ("legacy_data_layer", "Legacy class library - data layer", "samples/gestion/CapaDatos/CapaDatos.vbproj"),
+              ("soap_web_service", "VB.NET service project", "samples/gestion/AFIPWsaa/AFIPWsaa.vbproj"),
+              ("webforms_employee", "ASP.NET Web Forms employee application", "samples/employee-management/EmployeeManagementSystem/EmployeeManagementSystem.vbproj"),
+              ("webforms_bank_service", "ASP.NET Web Forms service component", "samples/employee-management/BankService/BankService.vbproj"),
+              ("aspnetcore_webapi", "ASP.NET Core Web API in Visual Basic", "samples/vbcore-webapi/src/VbAspNetCore/VbAspNetCore.vbproj"),
+              ("mixed_mvc_webforms", "VB.NET Web Forms component in mixed MVC solution", "samples/blackmagic-mvc/BlackMagic.WebForms/BlackMagic.WebForms.vbproj"),
+              ("sdk_class_library", "SDK-style Visual Basic class library", "samples/community-vb/Community.VisualBasic/Community.VisualBasic.vbproj"),
+          ]
+
+          summary = []
+          failures = []
+
+          for case_id, label, relative_project in cases:
+              project = root / relative_project
+              out_dir = results / case_id
+              out_dir.mkdir(parents=True, exist_ok=True)
+              print(f"\n=== {label} ===")
+              print(f"Project: {relative_project}")
+
+              if not project.is_file():
+                  row = {
+                      "case": case_id,
+                      "label": label,
+                      "project_path": relative_project,
+                      "execution": "FAIL",
+                      "error": "Sample .vbproj file was not present after clone.",
+                  }
+                  summary.append(row)
+                  failures.append(case_id)
+                  (out_dir / "execution-error.txt").write_text(row["error"], encoding="utf-8")
+                  continue
+
+              command = [
+                  sys.executable, "-m", "vbnet_migration_analyzer",
+                  str(project), "--no-build", "--roslyn", "off"
+              ]
+              completed = subprocess.run(
+                  command,
+                  cwd=out_dir,
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  timeout=180,
+              )
+              (out_dir / "analyzer-console.txt").write_text(completed.stdout, encoding="utf-8")
+
+              health_path = out_dir / "project-health.json"
+              critical_path = out_dir / "critical_updates.json"
+              row = {
+                  "case": case_id,
+                  "label": label,
+                  "project_path": relative_project,
+                  "execution": "PASS" if completed.returncode == 0 else "FAIL",
+                  "return_code": completed.returncode,
+                  "reports_created": {
+                      "project_health": health_path.is_file(),
+                      "critical_json": critical_path.is_file(),
+                  },
+              }
+
+              if completed.returncode != 0 or not health_path.is_file() or not critical_path.is_file():
+                  row["error"] = completed.stdout[-6000:]
+                  failures.append(case_id)
+                  summary.append(row)
+                  continue
+
+              try:
+                  health = json.loads(health_path.read_text(encoding="utf-8"))
+                  critical = json.loads(critical_path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  row["execution"] = "FAIL"
+                  row["error"] = f"Could not parse generated JSON: {exc}"
+                  failures.append(case_id)
+                  summary.append(row)
+                  continue
+
+              project_info = health.get("project", {})
+              health_summary = health.get("summary", {})
+              dependencies = health.get("dependencies", {}).get("third_party", {})
+              findings = health.get("findings", [])
+
+              row.update({
+                  "detected_project_name": project_info.get("name"),
+                  "detected_project_type": project_info.get("project_type"),
+                  "target_framework": project_info.get("target_framework"),
+                  "health_status": health_summary.get("health_status"),
+                  "files_scanned": health_summary.get("files_scanned"),
+                  "findings_count": len(findings) if isinstance(findings, list) else None,
+                  "classification_counts": dict(Counter(
+                      item.get("classification", "UNCLASSIFIED")
+                      for item in findings if isinstance(item, dict)
+                  )) if isinstance(findings, list) else {},
+                  "third_party_detected": dependencies.get("total_detected", len(dependencies.get("detected", []))),
+                  "third_party_families": dependencies.get("families", []),
+                  "detailed_report_findings_present": isinstance(findings, list),
+                  "critical_report_type": critical.get("report_type"),
+                  "critical_report_keys": list(critical.keys()),
+                  "critical_report_has_removed_section": (
+                      "critical_updates" in critical or "findings" in critical
+                  ),
+              })
+
+              required_critical_keys = {
+                  "project", "health", "blocking_reasons", "critical_dependencies",
+                  "summary", "target_framework_recommendation", "migration_required",
+                  "migration_order", "excluded", "scan_metadata"
+              }
+              missing_critical_keys = sorted(required_critical_keys - set(critical))
+              row["critical_report_missing_expected_keys"] = missing_critical_keys
+
+              if missing_critical_keys or row["critical_report_has_removed_section"]:
+                  row["schema_validation"] = "FAIL"
+                  failures.append(case_id)
+              else:
+                  row["schema_validation"] = "PASS"
+
+              # Preserve the two generated reports next to the per-project console log.
+              summary.append(row)
+              print(json.dumps(row, indent=2))
+
+          (results / "cross-project-summary.json").write_text(
+              json.dumps({"cases": summary, "failed_cases": failures}, indent=2),
+              encoding="utf-8"
+          )
+
+          lines = [
+              "# Cross-project VB.NET analyzer validation",
+              "",
+              "| Sample | Execution | Detected type | Target framework | Files | Findings | Third-party deps | Critical JSON |",
+              "|---|---|---|---|---:|---:|---:|---|",
+          ]
+          for row in summary:
+              lines.append(
+                  "| {label} | {execution} | {ptype} | {framework} | {files} | {findings} | {third_party} | {schema} |".format(
+                      label=row.get("label", row["case"]),
+                      execution=row.get("execution", "N/A"),
+                      ptype=row.get("detected_project_type") or "NOT DETECTED",
+                      framework=row.get("target_framework") or "not declared",
+                      files=row.get("files_scanned", "N/A"),
+                      findings=row.get("findings_count", "N/A"),
+                      third_party=row.get("third_party_detected", "N/A"),
+                      schema=row.get("schema_validation", "N/A"),
+                  )
+              )
+          lines += ["", f"**Cases run:** {len(summary)}", f"**Execution/schema failures:** {len(failures)}"]
+          (results / "cross-project-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          print("\n" + "\n".join(lines))
+          if failures:
+              print(f"Failed cases: {', '.join(failures)}")
+              sys.exit(1)
+          PY
+
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vbnet-cross-project-validation
+          path: validation-results/
+          if-no-files-found: warn
