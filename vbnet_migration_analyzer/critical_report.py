@@ -198,7 +198,7 @@ def build_critical_report(result: AnalysisResult) -> dict[str, Any]:
             "missing_assembly_groups": groups,
             "third_party": third_party,
         },
-        "critical_updates": [_finding_dict(f, i) for i, f in enumerate(findings, 1)],
+        "findings": [_finding_dict(f, i) for i, f in enumerate(findings, 1)],
         "summary": {
             "critical_count": len(findings),
             "migration_blockers": len(blockers),
