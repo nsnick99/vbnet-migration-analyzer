@@ -33,6 +33,25 @@ def _add_unique(items: list[str], value: str) -> None:
         items.append(value)
 
 
+def _legacy_framework_finding(target_framework: str | None) -> Finding | None:
+    """Flag classic .NET Framework targets as migration work, not as a parse/build error."""
+    framework = (target_framework or "").strip()
+    if not framework:
+        return Finding(
+            "MIG-013", "migration", "HIGH", "Target framework is not declared",
+            "The project target framework could not be determined from the project file.",
+            is_migration_blocker=True,
+        )
+    if re.match(r"^v[1-4](?:\.\d+){1,2}$", framework, re.I):
+        return Finding(
+            "MIG-013", "migration", "HIGH", "Legacy .NET Framework target",
+            f"Project targets legacy .NET Framework {framework}; a modern .NET migration requires a target-framework and dependency compatibility plan.",
+            evidence=framework,
+            is_migration_blocker=True,
+        )
+    return None
+
+
 def analyze(root: str | Path, run_build: bool = True, roslyn_mode: str = "auto") -> AnalysisResult:
     root_path = Path(root).resolve()
     projects = find_projects(root_path)
@@ -56,6 +75,10 @@ def analyze(root: str | Path, run_build: bool = True, roslyn_mode: str = "auto")
 
     for f in parse_findings:
         add(f)
+
+    framework_finding = _legacy_framework_finding(info.target_framework)
+    if framework_finding:
+        add(framework_finding)
 
     if len(projects) > 1:
         integrity.append(Finding("INT-007", "integrity", "MEDIUM", "Multiple projects found", f"{len(projects)} projects were found; only {project_path.name} was analyzed.", rel(project_path, root_path)))
