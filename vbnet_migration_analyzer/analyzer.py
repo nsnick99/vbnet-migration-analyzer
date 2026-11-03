@@ -12,6 +12,7 @@ from .models import AnalysisResult, Finding
 from .project import all_files, choose_project, discover_project, expand_item_patterns, find_path, find_projects, parse_project, project_items, read_source_text, resolve_item_path
 from .roslyn import relative_semantic_paths, run_semantic_analysis
 from .rules import analyze_vb_file
+from .third_party import inventory_third_party
 
 SOURCE_EXTENSIONS = {".vb", ".bas", ".cls", ".frm"}
 
@@ -126,6 +127,7 @@ def analyze(root: str | Path, run_build: bool = True, roslyn_mode: str = "auto")
         if resolved and find_path(resolved) is None:
             add(Finding("INT-005", "integrity", "HIGH", "Missing imported build file", "An imported .props/.targets file could not be found.", item, is_migration_blocker=True))
 
+    com_items = list(items["COMReference"]) + list(items["COMFileReference"])
     for kind in ("COMReference", "COMFileReference"):
         for item in items[kind]:
             add(Finding("MIG-001", "migration", "HIGH", "COM dependency", f"{kind} detected in the project; target compatibility must be established.", item, is_migration_blocker=True))
@@ -147,6 +149,15 @@ def analyze(root: str | Path, run_build: bool = True, roslyn_mode: str = "auto")
         source_cache[path] = text or ""
         for finding in analyze_vb_file(path, text or "", display):
             add(finding)
+
+    third_party = inventory_third_party(
+        root_dir,
+        xml_root,
+        info.project_file,
+        assembly_refs,
+        com_items,
+        source_cache,
+    )
 
     roslyn_data = {"available": False, "reason": "Roslyn analysis disabled."}
     if roslyn_mode != "off":
@@ -176,7 +187,7 @@ def analyze(root: str | Path, run_build: bool = True, roslyn_mode: str = "auto")
     project_key = hashlib.sha256(str(project_path.resolve()).encode("utf-8")).hexdigest()[:16]
     return AnalysisResult(info, len(files), dict(sorted(file_types.items())), blockers, risks, integrity,
                           sorted(set(attention), key=str.lower), build_verified, build_tool, project_key,
-                          semantic_analysis=roslyn_data)
+                          semantic_analysis=roslyn_data, third_party=third_party)
 
 
 def _dedupe(findings: list[Finding]) -> list[Finding]:
