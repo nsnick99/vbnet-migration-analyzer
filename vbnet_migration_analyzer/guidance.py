@@ -28,6 +28,7 @@ _GUIDANCE = {
     "MIG-010": ("REAL_BLOCKER", True, "Redesign multi-AppDomain usage for modern .NET process/component isolation.", "Re-run and validate the replacement isolation model."),
     "MIG-011": ("MANUAL_REVIEW", False, "Determine whether WCF usage is client-side or server-side and choose an appropriate migration path.", "Test the selected CoreWCF/HTTP/gRPC or other replacement."),
     "MIG-012": ("WARNING", False, "Move credentials into secure configuration or a secret-management mechanism.", "Re-run and confirm no credentials remain embedded in source."),
+    "MIG-013": ("REAL_BLOCKER", True, "Plan a framework modernization from .NET Framework to modern .NET and validate every dependency against the selected target.", "Re-run after selecting the target framework and verify the project/dependencies build on it."),
     "BLD-002": ("REAL_BLOCKER", True, "Resolve the local build/toolchain failure before relying on build verification.", "Re-run with the required local SDK/targeting pack installed."),
     "BLD-003": ("REAL_BLOCKER", True, "Investigate the non-zero build result, including SDK, targeting pack, package, and build dependencies.", "Re-run the build and confirm a successful exit code."),
     "ROS-000": ("REAL_BLOCKER", True, "Build or install the local Roslyn sidecar when semantic analysis is required.", "Re-run with --roslyn on and confirm semantic analysis is available."),
