@@ -6,6 +6,7 @@ __pycache__/
 # Analyzer runtime output
 migration-report.txt
 project-health.json
+critical_updates.json
 
 # Locally compiled Roslyn sidecar
 vbnet_migration_analyzer/roslyn/bin/
