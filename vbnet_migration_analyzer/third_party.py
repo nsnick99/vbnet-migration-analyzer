@@ -18,7 +18,6 @@ FRAMEWORK_PREFIXES = (
 
 KNOWN_FAMILIES = {
     "accord": "Accord.NET",
-    "accord.": "Accord.NET",
     "aforge": "AForge.NET",
     "adodb": "ADODB",
     "devexpress": "DevExpress",
@@ -109,25 +108,35 @@ def _project_package_references(xml_root: ET.Element, project_file: str) -> list
     return out
 
 
-def _usage_info(name: str, source_cache: dict[Path, str]) -> dict[str, Any]:
+def _usage_info(name: str, source_cache: dict[Path, str], root: Path) -> dict[str, Any]:
     candidates = {name.lower(), name.split(",", 1)[0].strip().lower()}
-    family = _family(name).lower()
     files: list[str] = []
     count = 0
     for path, text in source_cache.items():
         low = text.lower()
-        hits = 0
-        for candidate in candidates:
-            if candidate and len(candidate) > 2:
-                hits += low.count(candidate)
-        if family and family not in (name.lower(), "unknown"):
-            # Known family names are useful only as a fallback signal; avoid
-            # counting the display label as a source symbol too aggressively.
-            pass
+        hits = sum(low.count(candidate) for candidate in candidates if candidate and len(candidate) > 2)
         if hits:
-            files.append(path.as_posix())
+            try:
+                display = path.resolve().relative_to(root.resolve()).as_posix()
+            except ValueError:
+                display = path.as_posix()
+            files.append(display)
             count += hits
     return {"used": bool(files), "usage_count": count, "used_by": files}
+
+
+def _local_dlls(root: Path) -> list[Path]:
+    results: list[Path] = []
+    ignored = {".git", ".vs", "bin", "obj", "packages", "node_modules"}
+    for path in root.rglob("*.dll"):
+        try:
+            parts = {p.lower() for p in path.relative_to(root).parts[:-1]}
+        except ValueError:
+            continue
+        if parts & ignored:
+            continue
+        results.append(path)
+    return sorted(results)
 
 
 def inventory_third_party(
@@ -138,11 +147,7 @@ def inventory_third_party(
     com_items: list[str],
     source_cache: dict[Path, str],
 ) -> dict[str, Any]:
-    """Build a conservative dependency inventory from project metadata and source usage.
-
-    No network access is performed. Versions are reported only when explicitly present
-    in project/package metadata or inferable from a package path.
-    """
+    """Build a conservative dependency inventory without network access."""
     detected: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
@@ -166,18 +171,37 @@ def inventory_third_party(
             "status": "AVAILABLE" if ref.get("hintPathExists") else ("MISSING" if ref.get("hintPath") else "DECLARED"),
             "confidence": 1.0,
         }
-        item["usage"] = _usage_info(name, source_cache)
+        item["usage"] = _usage_info(name, source_cache, root)
         add(item)
+
+    referenced_names = {str(x.get("name") or "").lower() for x in assembly_refs}
+    for dll in _local_dlls(root):
+        name = dll.stem
+        if _framework(name):
+            continue
+        # Keep local DLLs as a separate inventory source even when they are not referenced.
+        add({
+            "name": name,
+            "family": _family(name),
+            "version": None,
+            "type": "DLL",
+            "source": "LOCAL_DLL",
+            "path": dll.relative_to(root).as_posix(),
+            "status": "PRESENT",
+            "referenced": name.lower() in referenced_names,
+            "confidence": 0.95,
+            "usage": _usage_info(name, source_cache, root),
+        })
 
     for package in _project_package_references(xml_root, project_file):
         package["confidence"] = 1.0
-        package["usage"] = _usage_info(str(package["name"]), source_cache)
+        package["usage"] = _usage_info(str(package["name"]), source_cache, root)
         add(package)
 
     for config in _package_configs(root):
         for package in _parse_packages_config(config):
             package["confidence"] = 1.0
-            package["usage"] = _usage_info(str(package["name"]), source_cache)
+            package["usage"] = _usage_info(str(package["name"]), source_cache, root)
             add(package)
 
     for name in com_items:
@@ -193,7 +217,7 @@ def inventory_third_party(
             "path": None,
             "status": "DETECTED",
             "confidence": 1.0,
-            "usage": _usage_info(name, source_cache),
+            "usage": _usage_info(name, source_cache, root),
         })
 
     families: dict[str, dict[str, Any]] = {}
@@ -202,7 +226,8 @@ def inventory_third_party(
         group = families.setdefault(family, {"name": family, "types": [], "dependencies": [], "statuses": []})
         if item.get("type") not in group["types"]:
             group["types"].append(item.get("type"))
-        group["dependencies"].append(item.get("name"))
+        if item.get("name") not in group["dependencies"]:
+            group["dependencies"].append(item.get("name"))
         if item.get("status") not in group["statuses"]:
             group["statuses"].append(item.get("status"))
 
